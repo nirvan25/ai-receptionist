@@ -1,138 +1,124 @@
-from flask import Flask, request, Response
+import os
+import json
+import datetime
+from flask import Flask, request
 from twilio.twiml.messaging_response import MessagingResponse
 from openai import OpenAI
-import os
+import google.auth
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 app = Flask(__name__)
 
-print("🔥 PHASE-4 — APPOINTMENT BOOKING ENABLED — LOADED 🔥")
+# --------------------
+# Load OpenAI
+# --------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_API_KEY)
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-# ---- Temporary in-memory session store ----
-sessions = {}  # { phone: { "name":None, "date":None, "slot":None, "type":None } }
-
-
-# ---- Clinic Info ----
-CLINIC_INFO = """
-Clinic Name: Chhajed Lung Care & Sleep Center
-Doctor: Dr. Prashant Chhajed (Pulmonologist)
-Location: A-405, Sangam Junction of S V Road and Saibaba Road, Santacruz (West), Mumbai – 400054
-Timings: Monday, Tuesday, Thursday, Saturday from 1:30 PM – 6:30 PM
-Consultation Types: OPD consultation or Video consultation
-"""
-
-SYSTEM_PROMPT = f"""
-You are an AI receptionist for Chhajed Lung Care & Sleep Center.
-NEVER give medical advice.
-If medical questions appear, ALWAYS say:
-"Only Dr. Chhajed can provide medical advice. I can help you book an appointment — would you like OPD or Video consultation?"
-Keep responses short (2-4 lines).
-
-Clinic info:
-{CLINIC_INFO}
-"""
+# --------------------
+# Load Google Calendar Credentials
+# --------------------
+GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
+creds_info = json.loads(GOOGLE_CREDS_JSON)
+credentials = service_account.Credentials.from_service_account_info(
+    creds_info,
+    scopes=["https://www.googleapis.com/auth/calendar"]
+)
+calendar_service = build("calendar", "v3", credentials=credentials)
+CALENDAR_ID = "primary"  # using your Gmail calendar for now
 
 
-# ---- GPT Wrapper ----
-def gpt_reply(msg):
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": msg}
-        ],
-        temperature=0.3
-    )
-    return response.choices[0].message.content.strip()
+# --------------------
+# Appointment Booking Helper
+# --------------------
+def create_calendar_event(name, appointment_time, appointment_type):
+    """Creates a Google Calendar event."""
+    event = {
+        "summary": f"Appointment – {name} ({appointment_type})",
+        "description": "Booked via WhatsApp AI Receptionist",
+        "start": {"dateTime": appointment_time.isoformat(), "timeZone": "Asia/Kolkata"},
+        "end": {
+            "dateTime": (appointment_time + datetime.timedelta(minutes=15)).isoformat(),
+            "timeZone": "Asia/Kolkata",
+        },
+    }
+
+    calendar_service.events().insert(calendarId=CALENDAR_ID, body=event).execute()
 
 
-# ---- Helper for starting a new session ----
-def start_session(phone):
-    sessions[phone] = {"name": None, "date": None, "slot": None, "type": None}
-
-
-# ---- Appointment Flow Logic ----
-def handle_appointment(phone, msg):
-    # Create session if not exists
-    if phone not in sessions:
-        start_session(phone)
-        return "Sure 👍, let's book your appointment. First, may I know your *full name*?"
-
-    session = sessions[phone]
-
-    if session["name"] is None:
-        session["name"] = msg
-        return "Thank you. Which *date* would you prefer? (e.g. 25 Jan)"
-
-    if session["date"] is None:
-        session["date"] = msg
-        return "Great. What *time slot* suits you?\n• Afternoon (1:30-3:30)\n• Evening (4:00-6:30)"
-
-    if session["slot"] is None:
-        session["slot"] = msg
-        return "Noted 👍\nWould you like *OPD* or *Video Consultation*?"
-
-    if session["type"] is None:
-        session["type"] = msg
-
-        # Final summary
-        summary = (
-            f"🗓 *Appointment Request Summary*\n"
-            f"👤 Name: {session['name']}\n"
-            f"📅 Date: {session['date']}\n"
-            f"⏰ Time: {session['slot']}\n"
-            f"🏥 Type: {session['type']}\n"
-            f"☎️ Phone: {phone.replace('whatsapp:', '')}\n\n"
-            f"Please reply *YES* to confirm or *NO* to cancel."
-        )
-        return summary
-
-    # Confirmation handling
-    if msg.lower() == "yes":
-        del sessions[phone]
-        return "✔️ Thank you. Your appointment request is submitted.\nOur team will contact you shortly to confirm exact timing."
-
-    if msg.lower() == "no":
-        del sessions[phone]
-        return "❌ Appointment cancelled. Let me know if you want to book again."
-
-    return "Please reply *YES* or *NO*."
-
-
-# ---- WhatsApp Route ----
+# --------------------
+# WhatsApp Endpoint
+# --------------------
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_reply():
-    msg = request.form.get("Body", "").strip()
-    phone = request.form.get("From", "")
+    incoming_msg = request.form.get("Body", "").lower().strip()
+    sender = request.form.get("From", "")
 
-    print(f"📩 Message from {phone}: {msg}")
+    print("Message from:", sender)
+    print("Body:", incoming_msg)
 
-    # Greeting handler
-    if msg.lower() in ["hi", "hello", "hey", "namaste"]:
-        return twilio_response(
-            "Hello 👋 Welcome to *Chhajed Lung Care & Sleep Center*.\n"
-            "I’m your AI assistant.\n"
-            "How can I help you today?\n"
-            "• Timings\n• Location\n• OPD / Video Appointment"
-        )
+    resp = MessagingResponse()
+    msg = resp.message()
 
-    # Detect appointment intent
-    if "book" in msg.lower() or "appointment" in msg.lower():
-        return twilio_response(handle_appointment(phone, msg))
+    # --------------------
+    # Handle Appointment Booking
+    # --------------------
+    if "book" in incoming_msg or "appointment" in incoming_msg:
+        msg.body("Sure 😊 — what is your **full name**?")
+        return str(resp)
 
-    # Default → send GPT answer
-    reply = gpt_reply(msg)
-    return twilio_response(reply)
+    # Ask name
+    elif incoming_msg.startswith("name:"):
+        user_name = incoming_msg.replace("name:", "").strip()
+        msg.body(f"Thanks {user_name}! 🙏\nPlease enter a preferred **date & time** (example: 26 Dec 5pm)")
+        return str(resp)
+
+    # Ask date & time
+    elif any(x in incoming_msg for x in ["am", "pm"]) and any(month in incoming_msg for month in ["jan","feb","mar","apr","may","jun","jul","aug","sep","oct","nov","dec","mon","tue","wed","thu","fri","sat","sun"]):
+        user_dt = incoming_msg.replace("at", "").replace("pm", " pm").replace("am", " am")
+        try:
+            dt = datetime.datetime.strptime(user_dt, "%d %b %I %p")
+            # Assume this year
+            dt = dt.replace(year=datetime.datetime.now().year)
+
+            # Create calendar booking
+            create_calendar_event("Patient", dt, "OPD")
+
+            msg.body("🎉 Appointment confirmed!\n\n📍 *Clinic:* Chhajed Lung Care & Sleep Center\n🕒 *Time:* " + dt.strftime("%d %b %I:%M %p") + "\n\nA reminder will be sent ✔️")
+            return str(resp)
+        except:
+            msg.body("❌ Could not understand the date — please type like:\n\n26 Dec 5pm")
+            return str(resp)
+
+    # --------------------
+    # FAQs
+    # --------------------
+    if "timing" in incoming_msg or "open" in incoming_msg:
+        msg.body("🕒 Clinic Hours:\nMon, Tue, Thu, Sat – 1:30pm to 6:30pm")
+        return str(resp)
+
+    if "location" in incoming_msg or "where" in incoming_msg or "address" in incoming_msg:
+        msg.body("📍 Address:\nA-405, Sangam Junction of S V Road & Saibaba Road,\nSantacruz (West), Mumbai 400054")
+        return str(resp)
+
+    if "doctor" in incoming_msg or "who" in incoming_msg:
+        msg.body("👨‍⚕️ Doctor: *Dr. Prashant Chhajed* (Lung Specialist & Sleep Medicine)")
+        return str(resp)
+
+    # --------------------
+    # Default fallback to AI
+    # --------------------
+    ai_answer = client.responses.create(
+        model="gpt-5-mini",
+        input=f"You are an AI receptionist for a lung clinic. Reply to: {incoming_msg}"
+    )
+    msg.body(ai_answer.output_text)
+    return str(resp)
 
 
-# ---- Twilio helper ----
-def twilio_response(text):
-    tw = MessagingResponse()
-    tw.message(text)
-    return Response(str(tw), mimetype="application/xml")
-
-
-# ---- Local Debug ----
+# --------------------
+# Run Flask
+# --------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+    app.run(port=10000, debug=True)
