@@ -9,46 +9,36 @@ from openai import OpenAI
 
 app = Flask(__name__)
 
-# ---- Load keys ----
+# ---- ENV KEYS ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=OPENAI_API_KEY)
-
 TWILIO_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH_TOKEN")
+RECEPTIONIST_NUMBER = os.getenv("RECEPTIONIST_NUMBER")  # MUST exist in Render
+
+client = OpenAI(api_key=OPENAI_API_KEY)
 twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
 
-RECEPTIONIST_NUMBER = "+917738889949"  # Clinic receptionist
+# ---- SESSION MEMORY ----
+SESSIONS = {}  # phone -> {name, datetime, reason, phone, step}
 
 TIMEZONE = "Asia/Kolkata"
-
-# ---- Session memory ----
-SESSIONS = {}  # phone -> {name, datetime, reason, user_phone, step}
-
 CLINIC_DAYS = ["monday", "tuesday", "thursday", "saturday"]
-CLINIC_OPEN = datetime.time(13, 30)
-CLINIC_CLOSE = datetime.time(18, 30)
+CLINIC_OPEN = datetime.time(13, 30)   # 1:30 PM
+CLINIC_CLOSE = datetime.time(18, 30)  # 6:30 PM
 
-
+# ---- Helper Functions ----
 def is_clinic_open(dt):
     weekday = dt.strftime("%A").lower()
-    if weekday not in CLINIC_DAYS:
-        return False
-    if not (CLINIC_OPEN <= dt.time() <= CLINIC_CLOSE):
-        return False
-    return True
-
+    return weekday in CLINIC_DAYS and CLINIC_OPEN <= dt.time() <= CLINIC_CLOSE
 
 def extract_info(text):
-    """Extract appointment info using GPT."""
+    """Extract info from user natural language using GPT"""
     response = client.responses.create(
         model="gpt-5-mini",
         input=f"""
-Extract structured appointment info ONLY as JSON:
-Fields:
-name, datetime (natural language OK), reason, phone
-
-Input:
-{text}
+Extract appointment info as JSON only.
+Keys: name, datetime, reason, phone
+Input: "{text}"
 """
     )
     try:
@@ -56,15 +46,13 @@ Input:
     except:
         return {}
 
-
-def update_session(phone, msg, session):
+def update_session(session, msg):
     data = extract_info(msg)
-
     for key in ["name", "datetime", "reason", "phone"]:
         if key in data and data[key] and not session.get(key):
             session[key] = data[key]
 
-    # Parse datetime → datetime object
+    # Convert datetime → datetime object
     if session.get("datetime") and not isinstance(session["datetime"], datetime.datetime):
         parsed = dateparser.parse(session["datetime"], settings={"TIMEZONE": TIMEZONE})
         if parsed:
@@ -72,27 +60,39 @@ def update_session(phone, msg, session):
 
     return session
 
-
 def missing_fields(s):
-    required = ["name", "datetime", "reason", "phone"]
-    return [f for f in required if not s.get(f)]
+    req = ["name", "datetime", "reason", "phone"]
+    return [x for x in req if not s.get(x)]
 
+def summary_text(s):
+    dt = s["datetime"]
+    return (
+        f"📋 *Appointment Summary*\n\n"
+        f"👤 *Name:* {s['name']}\n"
+        f"📞 *Patient WhatsApp:* +91{s['phone']}\n"
+        f"📅 *Date:* {dt.strftime('%d %b %Y')}\n"
+        f"🕒 *Time:* {dt.strftime('%I:%M %p')}\n"
+        f"📝 *Reason:* {s['reason']}\n\n"
+        "Reply YES to confirm or NO to change."
+    )
 
 def forward_to_receptionist(s):
-    text = (
+    dt = s["datetime"]
+    msg = (
         "📩 *New Appointment — Lung Clinic*\n\n"
         f"👤 *Name:* {s['name']}\n"
         f"📞 *Patient WhatsApp:* +91{s['phone']}\n"
-        f"📅 *Appointment:* {s['datetime'].strftime('%d %b – %I:%M %p')}\n"
+        f"📅 *Appointment:* {dt.strftime('%d %b – %I:%M %p')}\n"
         f"📝 *Reason:* {s['reason']}\n"
     )
     twilio_client.messages.create(
-        from_="whatsapp:+14155238886",  # Twilio sandbox sender
+        from_="whatsapp:+14155238886",
         to=f"whatsapp:{RECEPTIONIST_NUMBER}",
-        body=text
+        body=msg
     )
 
 
+# ---- MAIN BOT ENDPOINT ----
 @app.route("/whatsapp", methods=["POST"])
 def whatsapp_reply():
     msg = request.form.get("Body", "").strip()
@@ -101,50 +101,62 @@ def whatsapp_reply():
     res = MessagingResponse()
     reply = res.message()
 
-    # start new session
     if phone not in SESSIONS:
-        SESSIONS[phone] = {"step": "start"}
+        SESSIONS[phone] = {"step": "collect"}
 
     s = SESSIONS[phone]
 
-    # greeting
+    # greetings
     if msg.lower() in ["hi", "hello", "hey"]:
-        reply.body("Hello 👋 How can I help?\n(appointment • timings • location)")
+        reply.body("Hello 👋 How can I help?\nType: *I want appointment*")
         return Response(str(res), mimetype="application/xml")
 
-    # if user mentions appointment
-    if "book" in msg.lower() or "appointment" in msg.lower():
-        s["step"] = "collect"
-        reply.body("Sure 😊 What's your name?")
+    if "appointment" in msg.lower():
+        reply.body("Sure 😊 What's your full name?")
         return Response(str(res), mimetype="application/xml")
 
-    # update extracted info using GPT
-    s = update_session(phone, msg, s)
+    # Update info using GPT
+    s = update_session(s, msg)
     SESSIONS[phone] = s
 
-    # ask missing info in short
+    # Ask missing
     missing = missing_fields(s)
+    prompts = {
+        "name": "Your full name?",
+        "datetime": "Preferred date & time?",
+        "reason": "Reason for visit?",
+        "phone": "Your WhatsApp number? (digits only)"
+    }
     if missing:
-        prompts = {
-            "name": "Your full name?",
-            "datetime": "Preferred day & time?",
-            "reason": "Reason to visit?",
-            "phone": "WhatsApp number I should share with clinic? (digits only)"
-        }
         reply.body(prompts[missing[0]])
         return Response(str(res), mimetype="application/xml")
 
-    # validate time
+    # Validate clinic hrs
     dt = s["datetime"]
     if not is_clinic_open(dt):
-        reply.body("⛔ Clinic open only Mon/Tue/Thu/Sat — 1:30–6:30pm. Pick another time 🙂")
         s["datetime"] = None
+        reply.body("⛔ Clinic open Mon/Tue/Thu/Sat — 1:30–6:30pm.\nPick another time 🙂")
         return Response(str(res), mimetype="application/xml")
 
-    # FINAL – send info to receptionist
-    forward_to_receptionist(s)
-    reply.body("📩 Thank you — your details are noted.\nOur team will call you shortly to confirm.")
-    SESSIONS.pop(phone, None)
+    # Confirmation step
+    if s.get("step") != "confirm":
+        s["step"] = "confirm"
+        reply.body(summary_text(s))
+        return Response(str(res), mimetype="application/xml")
+
+    # Handle yes/no
+    if msg.lower() == "yes":
+        forward_to_receptionist(s)
+        reply.body("📩 Details noted — our team will call you shortly to confirm 👍")
+        SESSIONS.pop(phone, None)
+        return Response(str(res), mimetype="application/xml")
+
+    if msg.lower() == "no":
+        SESSIONS[phone] = {"step": "collect"}
+        reply.body("Okay — tell me the correct date & time 🙂")
+        return Response(str(res), mimetype="application/xml")
+
+    reply.body("Please reply YES or NO")
     return Response(str(res), mimetype="application/xml")
 
 
